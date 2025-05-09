@@ -1,7 +1,7 @@
 import sys
 import torch
 import torch.nn as nn
-from diffsynth import ModelManager, WanVideoReCamMasterPipeline, save_video, VideoData
+from diffsynth import ModelManager, WanVideoReCamMasterPipeline, save_video, VideoData, WanVideoReCamMasterPipelinePacked
 import torch, os, imageio, argparse
 from torchvision.transforms import v2
 from einops import rearrange
@@ -204,7 +204,8 @@ if __name__ == '__main__':
         "models/Wan-AI/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
         "models/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
     ])
-    pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager, device="cuda")
+    # pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager, device="cuda")
+    pipe = WanVideoReCamMasterPipelinePacked.from_model_manager(model_manager, device="cuda")
 
     # 2. Initialize additional modules introduced in ReCamMaster
     dim=pipe.dit.blocks[0].self_attn.q.weight.shape[0]
@@ -245,13 +246,17 @@ if __name__ == '__main__':
         source_video = batch["video"]
         target_camera = batch["camera"]
 
-        video = pipe(
+        videos = pipe(
             prompt=target_text,
             negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
             source_video=source_video,
             target_camera=target_camera,
             cfg_scale=args.cfg_scale,
             num_inference_steps=50,
-            seed=0, tiled=True
+            seed=0, tiled=True,
+            latent_window_size=5
         )
-        save_video(video, os.path.join(output_dir, f"video{batch_idx}.mp4"), fps=30, quality=5)
+        for video in videos:
+            save_video(video, os.path.join(output_dir, f"video1_{len(video)}.mp4"), fps=30, quality=5)
+        # save_video(videos, os.path.join(output_dir, f"video2_{len(videos)}.mp4"), fps=30, quality=5)
+        break

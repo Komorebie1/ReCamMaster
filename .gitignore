@@ -1,3 +1,8 @@
 *__pycache__
 *.ckpt
 Wan-AI
+models
+diffsynth.egg-info
+results
+toy_example.py
+datasets

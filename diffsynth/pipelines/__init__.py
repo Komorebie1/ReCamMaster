@@ -13,4 +13,5 @@ from .hunyuan_video import HunyuanVideoPipeline
 from .step_video import StepVideoPipeline
 from .wan_video import WanVideoPipeline
 from .wan_video_recammaster import WanVideoReCamMasterPipeline
+from .wan_video_recammaster_packed import WanVideoReCamMasterPipelinePacked
 KolorsImagePipeline = SDXLImagePipeline

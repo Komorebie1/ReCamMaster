@@ -194,28 +194,29 @@ class WanVideoReCamMasterPipeline(BasePipeline):
     @torch.no_grad()
     def __call__(
         self,
-        prompt,
-        negative_prompt="",
-        source_video=None,
-        target_camera=None,
-        input_image=None,
+        prompt,             # target_text
+        negative_prompt="", # 
+        source_video=None,  #
+        target_camera=None, # 
+        input_image=None,   
         input_video=None,
         denoising_strength=1.0,
-        seed=None,
+        seed=None,          # 0
         rand_device="cpu",
         height=480,
         width=832,
         num_frames=81,
-        cfg_scale=5.0,
-        num_inference_steps=50,
+        cfg_scale=5.0,      # 5.0
+        num_inference_steps=50, # 50
         sigma_shift=5.0,
-        tiled=True,
+        tiled=True,         # True
         tile_size=(30, 52),
         tile_stride=(15, 26),
         tea_cache_l1_thresh=None,
         tea_cache_model_id="",
         progress_bar_cmd=tqdm,
         progress_bar_st=None,
+        latent_window_size=None,
     ):
         # Parameter check
         height, width = self.check_resize_height_width(height, width)
@@ -243,11 +244,11 @@ class WanVideoReCamMasterPipeline(BasePipeline):
         
         # Encode source video (recammaster)
         self.load_models_to_device(['vae'])
-        source_video = source_video.to(dtype=self.torch_dtype, device=self.device)
-        source_latents = self.encode_video(source_video, **tiler_kwargs).to(dtype=self.torch_dtype, device=self.device)
+        source_video = source_video.to(dtype=self.torch_dtype, device=self.device)  # [1, 3, 81, 480, 832]
+        source_latents = self.encode_video(source_video, **tiler_kwargs).to(dtype=self.torch_dtype, device=self.device)  # [1, 16, 21, 60, 104]
 
         # Process target camera (recammaster)
-        cam_emb = target_camera.to(dtype=self.torch_dtype, device=self.device)
+        cam_emb = target_camera.to(dtype=self.torch_dtype, device=self.device)  # [1, 21, 12]
 
         # Encode prompts
         self.load_models_to_device(["text_encoder"])
@@ -372,10 +373,19 @@ def model_fn_wan_video(
     
     x, (f, h, w) = dit.patchify(x)
     
+    # freqs = torch.cat([
+    #     dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+    #     dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+    #     dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+    # ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+
     freqs = torch.cat([
         dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
         dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-        dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+        dit.freqs[3][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        dit.freqs[4][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+        dit.freqs[5][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
     
     # TeaCache
