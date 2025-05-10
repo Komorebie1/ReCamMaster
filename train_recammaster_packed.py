@@ -3,10 +3,10 @@ import os
 import re
 import torch, os, imageio, argparse
 from torchvision.transforms import v2
-from einops import rearrange
+from einops import rearrange, repeat
 import lightning as pl
 import pandas as pd
-from diffsynth import WanVideoReCamMasterPipeline, ModelManager, load_state_dict
+from diffsynth import WanVideoReCamMasterPipeline, ModelManager, load_state_dict, WanVideoReCamMasterPipelinePacked
 import torchvision
 from PIL import Image
 import numpy as np
@@ -133,7 +133,7 @@ class LightningModelForDataProcess(pl.LightningModule):
             model_path.append(image_encoder_path)
         model_manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
         model_manager.load_models(model_path)
-        self.pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager)
+        self.pipe = WanVideoReCamMasterPipelinePacked.from_model_manager(model_manager)
 
         self.tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
         
@@ -283,7 +283,8 @@ class LightningModelForTrain(pl.LightningModule):
             dit_path = dit_path.split(",")
             model_manager.load_models([dit_path])
         
-        self.pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager)
+        # self.pipe = WanVideoReCamMasterPipeline.from_model_manager(model_manager)
+        self.pipe = WanVideoReCamMasterPipelinePacked.from_model_manager(model_manager)
         self.pipe.scheduler.set_timesteps(1000, training=True)
 
         dim=self.pipe.dit.blocks[0].self_attn.q.weight.shape[0]
@@ -295,13 +296,23 @@ class LightningModelForTrain(pl.LightningModule):
             block.projector.weight = nn.Parameter(torch.eye(dim))
             block.projector.bias = nn.Parameter(torch.zeros(dim))
         
+        self.pipe.dit.patch_embedding_2x = nn.Conv3d(self.pipe.dit.in_dim, self.pipe.dit.dim, kernel_size=self.pipe.dit.patch_size_2x, stride=self.pipe.dit.patch_size_2x).to(dtype=torch.bfloat16, device=self.pipe.device)
+        self.pipe.dit.patch_embedding_4x = nn.Conv3d(self.pipe.dit.in_dim, self.pipe.dit.dim, kernel_size=self.pipe.dit.patch_size_4x, stride=self.pipe.dit.patch_size_4x).to(dtype=torch.bfloat16, device=self.pipe.device)
+        # self.pipe.dit.patch_embedding_2x.weight.data.copy_(repeat(self.pipe.dit.patch_embedding.weight, 'b c t h w -> b c (t tk) (h hk) (w wk)', tk=2, hk=2, wk=2) / 8.0)
+        # self.pipe.dit.patch_embedding_4x.weight.data.copy_(repeat(self.pipe.dit.patch_embedding.weight.data, 'b c t h w -> b c (t tk) (h hk) (w wk)', tk=4, hk=4, wk=4) / 64.0)
+        # self.pipe.dit.patch_embedding_2x.bias.data.copy_(self.pipe.dit.patch_embedding.bias.data)
+        # self.pipe.dit.patch_embedding_4x.bias.data.copy_(self.pipe.dit.patch_embedding.bias.data)
+        # Initialize the patch embeddings with Kaiming initialization
+        nn.init.xavier_normal_(self.pipe.dit.patch_embedding_2x.weight.flatten(1))
+        nn.init.xavier_normal_(self.pipe.dit.patch_embedding_4x.weight.flatten(1))
+        
         if resume_ckpt_path is not None:
             state_dict = torch.load(resume_ckpt_path, map_location="cpu")
             self.pipe.dit.load_state_dict(state_dict, strict=True)
 
         self.freeze_parameters()
         for name, module in self.pipe.denoising_model().named_modules():
-            if any(keyword in name for keyword in ["cam_encoder", "projector", "self_attn"]):
+            if any(keyword in name for keyword in ["cam_encoder", "projector", "self_attn", "patch_embedding", "patch_embedding_2x", "patch_embedding_4x"]):
                 print(f"Trainable: {name}")
                 for param in module.parameters():
                     param.requires_grad = True
@@ -341,25 +352,68 @@ class LightningModelForTrain(pl.LightningModule):
         
         cam_emb = batch["camera"].to(self.device)
 
+        # print(f"Latents shape: {latents.shape}") # [1, 16, 42, 60, 104]
+        # print(f"Prompt shape: {prompt_emb['context'].shape}") # [1, 512, 4096]
+        # print(f"Camera shape: {cam_emb.shape}") # [1, 21, 12]
+        height, width = latents.shape[3], latents.shape[4]
         # Loss
         self.pipe.device = self.device
-        noise = torch.randn_like(latents)
         timestep_id = torch.randint(0, self.pipe.scheduler.num_train_timesteps, (1,))
         timestep = self.pipe.scheduler.timesteps[timestep_id].to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
         extra_input = self.pipe.prepare_extra_input(latents)
-        origin_latents = copy.deepcopy(latents)
-        noisy_latents = self.pipe.scheduler.add_noise(latents, noise, timestep)
-        tgt_latent_len = noisy_latents.shape[2] // 2
-        noisy_latents[:, :, tgt_latent_len:, ...] = origin_latents[:, :, tgt_latent_len:, ...]
-        training_target = self.pipe.scheduler.training_target(latents, noise, timestep)
+
+        latents, source_latents = latents.chunk(2, dim=2)
+        tgt_latent_len = latents.shape[2]
+        noise = torch.randn_like(latents)
+        noisy_latents = self.pipe.scheduler.add_noise(latents, noise, timestep).cpu() # 给干净的加噪 (1 - sigma) * latents + sigma * noise
+        training_target = self.pipe.scheduler.training_target(latents, noise, timestep) # noise - latents
+
+        clean_latents_size, clean_latents_2x_size, clean_latents_4x_size = 1, 2, 8
+        history_latents = torch.zeros(size=(1, 16, clean_latents_size + clean_latents_2x_size + clean_latents_4x_size, height, width), dtype=torch.bfloat16, device=self.device)
+
+        latent_window_size = 5
+        total_latent_sections = 4
+
+        latent_paddings = reversed(range(total_latent_sections))
+
+        for latent_padding in latent_paddings:
+            is_last_section = latent_padding == 0
+            first_frame_size = int(is_last_section)
+            latent_padding_size = latent_padding * latent_window_size + (1 - first_frame_size)
+            current_window_size = latent_window_size + first_frame_size
+
+            indices = torch.arange(0, sum([latent_padding_size, current_window_size*2, clean_latents_size, clean_latents_2x_size, clean_latents_4x_size]))
+            blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indcies = \
+                torch.split(indices, [latent_padding_size, current_window_size*2, clean_latents_size, clean_latents_2x_size, clean_latents_4x_size], dim=0)
+            clean_latent_indices = clean_latent_indices_post
+
+            clean_latents_post, clean_latents_2x, clean_latents_4x = \
+                history_latents[:, :, :clean_latents_size+clean_latents_2x_size+clean_latents_4x_size, :, :].split([clean_latents_size, clean_latents_2x_size, clean_latents_4x_size], dim=2)
+            clean_latents = clean_latents_post
+
+            current_noisy_latents = noisy_latents[:, :, latent_padding_size: latent_padding_size + current_window_size, ...]
+            current_source_latents = source_latents[:, :, latent_padding_size: latent_padding_size + current_window_size, ...]
+            current_cam_emb = cam_emb[:, latent_padding_size: latent_padding_size + current_window_size, ...]
+
+            latent_input = torch.cat([current_noisy_latents, current_source_latents], dim=2)
+            noise_pred = self.pipe.denoising_model()(
+                latent_input, timestep=timestep, cam_emb=current_cam_emb, 
+                latent_indices=latent_indices,
+                clean_latents=clean_latents,
+                clean_latents_indices=clean_latent_indices,
+                clean_latents_2x=clean_latents_2x,
+                clean_latents_2x_indices=clean_latent_2x_indices,
+                clean_latents_4x=clean_latents_4x,
+                clean_latents_4x_indices=clean_latent_4x_indcies,
+                **prompt_emb, **extra_input, **image_emb,
+                use_gradient_checkpointing=self.use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
+            )
+            history_latents = torch.cat([noise_pred, history_latents], dim=2)
+        
         
         # Compute loss
-        noise_pred = self.pipe.denoising_model()(
-            noisy_latents, timestep=timestep, cam_emb=cam_emb, **prompt_emb, **extra_input, **image_emb,
-            use_gradient_checkpointing=self.use_gradient_checkpointing,
-            use_gradient_checkpointing_offload=self.use_gradient_checkpointing_offload
-        )
-        loss = torch.nn.functional.mse_loss(noise_pred[:, :, :tgt_latent_len, ...].float(), training_target[:, :, :tgt_latent_len, ...].float())
+        loss = torch.nn.functional.mse_loss(history_latents[:, :, :tgt_latent_len, ...].float(), training_target[:, :, :tgt_latent_len, ...].float())
         loss = loss * self.pipe.scheduler.training_weight(timestep)
 
         # Record log

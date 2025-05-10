@@ -4,7 +4,7 @@ import torch.nn as nn
 from diffsynth import ModelManager, WanVideoReCamMasterPipeline, save_video, VideoData, WanVideoReCamMasterPipelinePacked
 import torch, os, imageio, argparse
 from torchvision.transforms import v2
-from einops import rearrange
+from einops import rearrange, repeat
 import pandas as pd
 import torchvision
 from PIL import Image
@@ -217,11 +217,23 @@ if __name__ == '__main__':
         block.projector.weight = nn.Parameter(torch.eye(dim))
         block.projector.bias = nn.Parameter(torch.zeros(dim))
 
+    # pipe.dit.patch_embedding_2x.weight.zero_()
+    # pipe.dit.patch_embedding_4x.weight.zero_()
+    # pipe.dit.patch_embedding_2x.bias.zero_()
+    # pipe.dit.patch_embedding_4x.bias.zero_()
+
     # 3. Load ReCamMaster checkpoint
     state_dict = torch.load(args.ckpt_path, map_location="cpu")
     pipe.dit.load_state_dict(state_dict, strict=True)
     pipe.to("cuda")
     pipe.to(dtype=torch.bfloat16)
+
+    pipe.dit.patch_embedding_2x = nn.Conv3d(pipe.dit.in_dim, pipe.dit.dim, kernel_size=pipe.dit.patch_size_2x, stride=pipe.dit.patch_size_2x).to(dtype=torch.bfloat16, device=pipe.device)
+    pipe.dit.patch_embedding_4x = nn.Conv3d(pipe.dit.in_dim, pipe.dit.dim, kernel_size=pipe.dit.patch_size_4x, stride=pipe.dit.patch_size_4x).to(dtype=torch.bfloat16, device=pipe.device)
+    pipe.dit.patch_embedding_2x.weight.data.copy_(repeat(pipe.dit.patch_embedding.weight, 'b c t h w -> b c (t tk) (h hk) (w wk)', tk=2, hk=2, wk=2) / 8.0)
+    pipe.dit.patch_embedding_4x.weight.data.copy_(repeat(pipe.dit.patch_embedding.weight.data, 'b c t h w -> b c (t tk) (h hk) (w wk)', tk=4, hk=4, wk=4) / 64.0)
+    pipe.dit.patch_embedding_2x.bias.data.copy_(pipe.dit.patch_embedding.bias.data)
+    pipe.dit.patch_embedding_4x.bias.data.copy_(pipe.dit.patch_embedding.bias.data)
 
     output_dir = os.path.join(args.output_dir, f"cam_type{args.cam_type}")
     if not os.path.exists(output_dir):
@@ -257,6 +269,6 @@ if __name__ == '__main__':
             latent_window_size=5
         )
         for video in videos:
-            save_video(video, os.path.join(output_dir, f"video1_{len(video)}.mp4"), fps=30, quality=5)
+            save_video(video, os.path.join(output_dir, f"video7_{len(video)}.mp4"), fps=30, quality=5)
         # save_video(videos, os.path.join(output_dir, f"video2_{len(videos)}.mp4"), fps=30, quality=5)
         break

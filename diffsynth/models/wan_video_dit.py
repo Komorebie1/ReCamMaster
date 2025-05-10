@@ -5,6 +5,7 @@ import math
 from typing import Tuple, Optional
 from einops import rearrange
 from .utils import hash_state_dict_keys
+from .framepack_utils import get_rope_freqs, pad_for_3d_conv, center_down_sample_3d
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
@@ -110,6 +111,7 @@ def precompute_freqs_cis_packed(dim: int, end: int = 1024, theta: float = 10000.
 
 def rope_apply_packed(x, freqs, num_heads):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads) # [1, 65520, 12, 128]
+    freqs = freqs.unsqueeze(2)
     cos, sin = freqs.chunk(2, dim=-1) # [65520, 1, 64]
     x_pair = x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2) # [1, 65520, 12, 64, 2]
     x_real, x_imag = x_pair[..., 0], x_pair[..., 1] # [1, 65520, 12, 64]
@@ -343,6 +345,62 @@ class WanModel(torch.nn.Module):
             x=self.patch_size[0], y=self.patch_size[1], z=self.patch_size[2]
         )
 
+    # def forward(self,
+    #             x: torch.Tensor,
+    #             timestep: torch.Tensor,
+    #             cam_emb: torch.Tensor,
+    #             context: torch.Tensor,
+    #             clip_feature: Optional[torch.Tensor] = None,
+    #             y: Optional[torch.Tensor] = None,
+    #             use_gradient_checkpointing: bool = False,
+    #             use_gradient_checkpointing_offload: bool = False,
+    #             **kwargs,
+    #             ):
+    #     t = self.time_embedding(
+    #         sinusoidal_embedding_1d(self.freq_dim, timestep))
+    #     t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
+    #     context = self.text_embedding(context)
+        
+    #     if self.has_image_input:
+    #         x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
+    #         clip_embdding = self.img_emb(clip_feature)
+    #         context = torch.cat([clip_embdding, context], dim=1)
+        
+    #     x, (f, h, w) = self.patchify(x) # x.shape: [1, 65520, 1536]
+        
+    #     freqs = torch.cat([
+    #         self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+    #         self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+    #         self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+    #     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        
+    #     def create_custom_forward(module):
+    #         def custom_forward(*inputs):
+    #             return module(*inputs)
+    #         return custom_forward
+
+    #     for block in self.blocks:
+    #         if self.training and use_gradient_checkpointing:
+    #             if use_gradient_checkpointing_offload:
+    #                 with torch.autograd.graph.save_on_cpu():
+    #                     x = torch.utils.checkpoint.checkpoint(
+    #                         create_custom_forward(block),
+    #                         x, context, cam_emb, t_mod, freqs,
+    #                         use_reentrant=False,
+    #                     )
+    #             else:
+    #                 x = torch.utils.checkpoint.checkpoint(
+    #                     create_custom_forward(block),
+    #                     x, context, cam_emb, t_mod, freqs,
+    #                     use_reentrant=False,
+    #                 )
+    #         else:
+    #             x = block(x, context, cam_emb, t_mod, freqs)
+
+    #     x = self.head(x, t)
+    #     x = self.unpatchify(x, (f, h, w))
+    #     return x
+
     def forward(self,
                 x: torch.Tensor,
                 timestep: torch.Tensor,
@@ -352,10 +410,15 @@ class WanModel(torch.nn.Module):
                 y: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
-                **kwargs,
-                ):
-        t = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, timestep))
+                latent_indices: Optional[torch.Tensor] = None,
+                clean_latents: Optional[torch.Tensor] = None,
+                clean_latents_indices: Optional[torch.Tensor] = None,
+                clean_latents_2x: Optional[torch.Tensor] = None,
+                clean_latents_2x_indices: Optional[torch.Tensor] = None,
+                clean_latents_4x: Optional[torch.Tensor] = None,
+                clean_latents_4x_indices: Optional[torch.Tensor] = None,
+                **kwargs,):
+        t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
         
@@ -363,14 +426,8 @@ class WanModel(torch.nn.Module):
             x = torch.cat([x, y], dim=1)  # (b, c_x + c_y, f, h, w)
             clip_embdding = self.img_emb(clip_feature)
             context = torch.cat([clip_embdding, context], dim=1)
-        
-        x, (f, h, w) = self.patchify(x) # x.shape: [1, 65520, 1536]
-        
-        freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+
+        x, freqs, (f, h, w) = self.frame_pack(x, latent_indices, clean_latents, clean_latents_indices, clean_latents_2x, clean_latents_2x_indices, clean_latents_4x, clean_latents_4x_indices)
         
         def create_custom_forward(module):
             def custom_forward(*inputs):
@@ -396,8 +453,65 @@ class WanModel(torch.nn.Module):
                 x = block(x, context, cam_emb, t_mod, freqs)
 
         x = self.head(x, t)
-        x = self.unpatchify(x, (f, h, w))
+        original_context_lenght = f * h * w
+        x = x[:, -original_context_lenght:, :]  # [1, 21*30*52, 1536]
+        x = self.unpatchify(x, (f, h, w)) # [f, h, w] = [21, 30, 52]
         return x
+
+    def frame_pack(self,
+               x, 
+               latent_indices, 
+               clean_latents, 
+               clean_latents_indices, 
+               clean_latents_2x, 
+               clean_latents_2x_indices, 
+               clean_latents_4x, 
+               clean_latents_4x_indices):
+
+        hidden_states = self.patch_embedding(x) # [1, 1536, 5, 30, 52]
+        B, C, F, H, W = hidden_states.shape
+        hidden_states = rearrange(hidden_states, 'b c t h w -> b (t h w) c').contiguous()
+
+        rope_freqs = get_rope_freqs(self.freqs, latent_indices, H, W, device=hidden_states.device)
+        rope_freqs = rope_freqs.flatten(2).transpose(1, 2)
+
+        if clean_latents is not None and clean_latents_indices is not None:
+            clean_latents = clean_latents.to(hidden_states)
+            clean_latents = self.patch_embedding(clean_latents)
+            clean_latents = rearrange(clean_latents, 'b c f h w -> b (f h w) c').contiguous()
+            hidden_states = torch.cat([clean_latents, hidden_states], dim=1)
+
+            clean_latents_rope_freqs = get_rope_freqs(self.freqs, clean_latents_indices, H, W, device=hidden_states.device)
+            clean_latents_rope_freqs = clean_latents_rope_freqs.flatten(2).transpose(1, 2)
+            rope_freqs = torch.cat([clean_latents_rope_freqs, rope_freqs], dim=1)
+
+        if clean_latents_2x is not None and clean_latents_2x_indices is not None:
+            clean_latents_2x = clean_latents_2x.to(hidden_states)
+            clean_latents_2x = pad_for_3d_conv(clean_latents_2x, (2, 4, 4))
+            clean_latents_2x = self.patch_embedding_2x(clean_latents_2x)
+            clean_latents_2x = rearrange(clean_latents_2x, 'b c f h w -> b (f h w) c').contiguous()
+            hidden_states = torch.cat([clean_latents_2x, hidden_states], dim=1)
+
+            clean_latents_2x_rope_freqs = get_rope_freqs(self.freqs, clean_latents_2x_indices, H, W, device=hidden_states.device)
+            clean_latents_2x_rope_freqs = pad_for_3d_conv(clean_latents_2x_rope_freqs, (2, 2, 2))
+            clean_latents_2x_rope_freqs = center_down_sample_3d(clean_latents_2x_rope_freqs, (2, 2, 2))
+            clean_latents_2x_rope_freqs = clean_latents_2x_rope_freqs.flatten(2).transpose(1, 2)
+            rope_freqs = torch.cat([clean_latents_2x_rope_freqs, rope_freqs], dim=1)
+
+        if clean_latents_4x is not None and clean_latents_4x_indices is not None:
+            clean_latents_4x = clean_latents_4x.to(hidden_states)
+            clean_latents_4x = pad_for_3d_conv(clean_latents_4x, (4, 8, 8))
+            clean_latents_4x = self.patch_embedding_4x(clean_latents_4x)
+            clean_latents_4x = rearrange(clean_latents_4x, 'b c f h w -> b (f h w) c').contiguous()
+            hidden_states = torch.cat([clean_latents_4x, hidden_states], dim=1)
+
+            clean_latents_4x_rope_freqs = get_rope_freqs(self.freqs, clean_latents_4x_indices, H, W, device=hidden_states.device)
+            clean_latents_4x_rope_freqs = pad_for_3d_conv(clean_latents_4x_rope_freqs, (4, 4, 4))
+            clean_latents_4x_rope_freqs = center_down_sample_3d(clean_latents_4x_rope_freqs, (4, 4, 4))
+            clean_latents_4x_rope_freqs = clean_latents_4x_rope_freqs.flatten(2).transpose(1, 2)
+            rope_freqs = torch.cat([clean_latents_4x_rope_freqs, rope_freqs], dim=1)
+
+        return hidden_states, rope_freqs, (F, H, W)
 
     @staticmethod
     def state_dict_converter():

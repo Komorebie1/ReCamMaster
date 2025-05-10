@@ -369,11 +369,11 @@ class WanVideoReCamMasterPipelinePacked(BasePipeline):
             if history_pixels is None:
                 history_pixels = self.decode_video(real_history_latents, **tiler_kwargs)
             else:
-                section_latent_frames = current_window_size
-                overlapped_frames = latent_window_size * 4 # latent to frames
+                section_latent_frames = current_window_size + latent_window_size
+                overlapped_frames = latent_window_size * 4 - 3 # latent to frames
 
                 current_pixels = self.decode_video(real_history_latents[:, :, :section_latent_frames], **tiler_kwargs)
-                history_pixels = soft_append_bcthw(current_pixels, history_pixels, 0)
+                history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
             # print("final latents shape:", latents.shape)
             # frames = self.decode_video(latents, **tiler_kwargs)
@@ -472,31 +472,10 @@ def model_fn_wan_video(
         context = torch.cat([clip_embdding, context], dim=1)
 
     # print("before patchify x shape:", x.shape) # [1, 16, 42, 60, 104]
-    x, (f, h, w) = dit.patchify(x) # patchify 被放到 framepack 里面了
+    # x, (f, h, w) = dit.patchify(x) # patchify 被放到 framepack 里面了
     # print("after patchify x shape:", x.shape) # [1, 7800, 1536]
 
-    # x, freqs, (f, h, w) = frame_pack(dit, x, latent_indices, clean_latents, clean_latents_indices, clean_latents_2x, clean_latents_2x_indices, clean_latents_4x, clean_latents_4x_indices)
-    
-    # 这里的 freqs 是预计算好的，直接拿来切片用就行
-    # freqs = torch.cat([
-    #     dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-    #     dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-    #     dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-    # ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-    # print(dit.freqs[0].shape) # [1024, 22]
-    # print(dit.freqs[1].shape) # [1024, 21]
-    # print(dit.freqs[2].shape) # [1024, 21]
-    # print(freqs.shape) # [21*30*52, 1, 64]
-    freqs = torch.cat([
-        dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-        dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-        dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-        dit.freqs[3][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-        dit.freqs[4][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-        dit.freqs[5][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-
-    # print("after pack x shape, freqs shape:", x.shape, freqs.shape) # torch.Size([1, 11726, 1536]) torch.Size([1, 11726, 256])
+    x, freqs, (f, h, w) = frame_pack(dit, x, latent_indices, clean_latents, clean_latents_indices, clean_latents_2x, clean_latents_2x_indices, clean_latents_4x, clean_latents_4x_indices)
     
     for block in dit.blocks:
         x = block(x, context, cam_emb, t_mod, freqs)
@@ -534,44 +513,6 @@ class PatchEmbedForCleanLatents(torch.nn.Module):
         self.load_state_dict(sd)
         return
 
-class RotaryPosEmbed(torch.nn.Module):
-    def __init__(self, rope_dim, theta: float = 10000.0):
-        super().__init__()
-        self.DT, self.DY, self.DX = rope_dim
-        self.theta = theta
-
-    @torch.no_grad()
-    def get_frequency(self, dim, pos):
-        T, H, W = pos.shape
-        freqs = 1.0 / (self.theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=pos.device)[: (dim // 2)] / dim))
-        freqs = torch.outer(freqs, pos.reshape(-1)).unflatten(-1, (T, H, W)).repeat_interleave(2, dim=0)
-        return freqs.cos(), freqs.sin()
-
-    @torch.no_grad()
-    def forward_inner(self, frame_indices, height, width, device):
-
-        GT, GY, GX = torch.meshgrid(
-            frame_indices.to(device=device, dtype=torch.float32),
-            torch.arange(0, height, device=device, dtype=torch.float32),
-            torch.arange(0, width, device=device, dtype=torch.float32),
-            indexing="ij"
-        )
-
-        FCT, FST = self.get_frequency(self.DT, GT)
-        FCY, FSY = self.get_frequency(self.DY, GY)
-        FCX, FSX = self.get_frequency(self.DX, GX)
-
-        result = torch.cat([FCT, FCY, FCX, FST, FSY, FSX], dim=0)
-        print("results: ", result.shape) # [dim, T, H, W]
-
-        return result.to(device)
-
-    @torch.no_grad()
-    def forward(self, frame_indices, height, width, device):
-        frame_indices = frame_indices.unbind(0)
-        results = [self.forward_inner(f, height, width, device) for f in frame_indices]
-        results = torch.stack(results, dim=0)
-        return results
 
 def get_rope_freqs(freqs, frame_indices, h, w, device):
     f = frame_indices.shape[0]
@@ -594,9 +535,10 @@ def frame_pack(dit,
                clean_latents_2x_indices, 
                clean_latents_4x, 
                clean_latents_4x_indices):
-        patch_embedder_for_clean_latents = PatchEmbedForCleanLatents(dit.in_dim, dit.dim)
-        patch_embedder_for_clean_latents.initialize_weight_from_another_conv3d(dit.patch_embedding)
-        hidden_states = patch_embedder_for_clean_latents.proj(x) # [1, 1536, 5, 30, 52]
+        # patch_embedder_for_clean_latents = PatchEmbedForCleanLatents(dit.in_dim, dit.dim)
+        # patch_embedder_for_clean_latents.initialize_weight_from_another_conv3d(dit.patch_embedding)
+        # hidden_states = patch_embedder_for_clean_latents.proj(x) # [1, 1536, 5, 30, 52]
+        hidden_states = dit.patch_embedding(x) # [1, 1536, 5, 30, 52]
         B, C, F, H, W = hidden_states.shape
         hidden_states = rearrange(hidden_states, 'b c t h w -> b (t h w) c').contiguous()
         # rope = RotaryPosEmbed((dit.head_dim - 2 * (dit.head_dim // 3), dit.head_dim // 3, dit.head_dim // 3)) # head_dim = 128
@@ -607,7 +549,8 @@ def frame_pack(dit,
 
         if clean_latents is not None and clean_latents_indices is not None:
             clean_latents = clean_latents.to(hidden_states)
-            clean_latents = patch_embedder_for_clean_latents.proj(clean_latents)
+            # clean_latents = patch_embedder_for_clean_latents.proj(clean_latents)
+            clean_latents = dit.patch_embedding(clean_latents)
             clean_latents = rearrange(clean_latents, 'b c f h w -> b (f h w) c').contiguous()
             hidden_states = torch.cat([clean_latents, hidden_states], dim=1)
 
@@ -619,7 +562,8 @@ def frame_pack(dit,
         if clean_latents_2x is not None and clean_latents_2x_indices is not None:
             clean_latents_2x = clean_latents_2x.to(hidden_states)
             clean_latents_2x = pad_for_3d_conv(clean_latents_2x, (2, 4, 4))
-            clean_latents_2x = patch_embedder_for_clean_latents.proj_2x(clean_latents_2x)
+            # clean_latents_2x = patch_embedder_for_clean_latents.proj_2x(clean_latents_2x)
+            clean_latents_2x = dit.patch_embedding_2x(clean_latents_2x)
             clean_latents_2x = rearrange(clean_latents_2x, 'b c f h w -> b (f h w) c').contiguous()
             hidden_states = torch.cat([clean_latents_2x, hidden_states], dim=1)
 
@@ -633,7 +577,8 @@ def frame_pack(dit,
         if clean_latents_4x is not None and clean_latents_4x_indices is not None:
             clean_latents_4x = clean_latents_4x.to(hidden_states)
             clean_latents_4x = pad_for_3d_conv(clean_latents_4x, (4, 8, 8))
-            clean_latents_4x = patch_embedder_for_clean_latents.proj_4x(clean_latents_4x)
+            # clean_latents_4x = patch_embedder_for_clean_latents.proj_4x(clean_latents_4x)
+            clean_latents_4x = dit.patch_embedding_4x(clean_latents_4x)
             clean_latents_4x = rearrange(clean_latents_4x, 'b c f h w -> b (f h w) c').contiguous()
             hidden_states = torch.cat([clean_latents_4x, hidden_states], dim=1)
 
