@@ -7,6 +7,6 @@ python train_recammaster_packed.py  \
     --vae_path "models/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth"  \
     --tiled  \
     --num_frames 81  \
-    --height 480  \
-    --width 832 \
+    --height 640  \
+    --width 640 \
     --dataloader_num_workers 2

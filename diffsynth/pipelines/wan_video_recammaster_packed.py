@@ -267,7 +267,6 @@ class WanVideoReCamMasterPipelinePacked(BasePipeline):
         history_latents = torch.zeros(size=(1, 16, clean_latents_size + clean_latents_2x_size + clean_latents_4x_size, height//8, width//8), dtype=torch.bfloat16).cpu()
         history_pixels = None
         total_generated_latent_frames = 0
-        history_cam_emb = torch.zeros(size=(1, clean_latents_size + clean_latents_2x_size + clean_latents_4x_size, 12)).to(cam_emb)
 
 
         total_latent_sections = (num_frames - 1) // (latent_window_size * 4)
@@ -282,31 +281,44 @@ class WanVideoReCamMasterPipelinePacked(BasePipeline):
         for latent_padding in latent_paddings:
             is_last_section = latent_padding == 0
             first_frame_size = int(is_last_section)
-            latent_padding_size = latent_padding * latent_window_size + 1 - first_frame_size
+            # latent_padding_size = latent_padding * latent_window_size + 1 - first_frame_size
+            latent_padding_size = latent_padding * latent_window_size 
             current_window_size = latent_window_size + first_frame_size
 
             # Initialize noise
             # latent_window_size = 5, 5 * 4 frames per section
-            noise = self.generate_noise((1, 16, current_window_size, height//8, width//8), seed=seed, device=rand_device, dtype=torch.float32)
+            noise = self.generate_noise((1, 16, latent_window_size, height//8, width//8), seed=seed, device=rand_device, dtype=torch.float32)
             noise = noise.to(dtype=self.torch_dtype, device=self.device)
             latents = noise
 
-            indices = torch.arange(0, sum([latent_padding_size, current_window_size*2, clean_latents_size, clean_latents_2x_size, clean_latents_4x_size]))
-            blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indcies = \
-                torch.split(indices, [latent_padding_size, current_window_size*2, clean_latents_size, clean_latents_2x_size, clean_latents_4x_size], dim=0)
-            clean_latent_indices = clean_latent_indices_post
+            # indices = torch.arange(0, sum([latent_padding_size, current_window_size*2, clean_latents_size, clean_latents_2x_size, clean_latents_4x_size]))
+            # blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indcies = \
+            #     torch.split(indices, [latent_padding_size, current_window_size*2, clean_latents_size, clean_latents_2x_size, clean_latents_4x_size], dim=0)
+            # clean_latent_indices = clean_latent_indices_post
+
+            # clean_latents_pre = start_latents.to(history_latents)
+            # clean_latents_post, clean_latents_2x, clean_latents_4x = \
+            #     history_latents[:, :, :clean_latents_size+clean_latents_2x_size+clean_latents_4x_size, :, :].split([clean_latents_size, clean_latents_2x_size, clean_latents_4x_size], dim=2)
+            # clean_latents = clean_latents_post
+
+            indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size*2, clean_latents_size, clean_latents_2x_size, clean_latents_4x_size]))
+            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indcies = \
+                torch.split(indices, [1, latent_padding_size, latent_window_size*2, clean_latents_size, clean_latents_2x_size, clean_latents_4x_size], dim=0)
+            clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=0)
 
             clean_latents_pre = start_latents.to(history_latents)
             clean_latents_post, clean_latents_2x, clean_latents_4x = \
                 history_latents[:, :, :clean_latents_size+clean_latents_2x_size+clean_latents_4x_size, :, :].split([clean_latents_size, clean_latents_2x_size, clean_latents_4x_size], dim=2)
-            clean_latents = clean_latents_post
+            clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
-            current_cam_emb = cam_emb[:, latent_padding_size: latent_padding_size + current_window_size, ...]
-            current_source_latents = source_latents[:, :, latent_padding_size: latent_padding_size + current_window_size, ...]
+            current_cam_emb = cam_emb[:, 1 + latent_padding_size: 1 + latent_padding_size + latent_window_size, ...]
+            cam_emb_post = cam_emb[:, 1 + latent_padding_size + latent_window_size: 1 + latent_padding_size + latent_window_size + 1, ...] if 1 + latent_padding_size + latent_window_size < 21 else torch.zeros_like(start_cam_emb).to(start_cam_emb)
+            clean_cam_emb = torch.cat([start_cam_emb, cam_emb_post], dim=1)
+            current_source_latents = source_latents[:, :, 1 + latent_padding_size: 1 + latent_padding_size + latent_window_size, ...]
 
             # Denoise
             self.load_models_to_device(["dit"])
-            tgt_latent_length = latents.shape[2]
+            tgt_latent_len = latents.shape[2]
             for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
                 timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
 
@@ -321,6 +333,7 @@ class WanVideoReCamMasterPipelinePacked(BasePipeline):
                                                      cam_emb=current_cam_emb, 
                                                      latent_indices=latent_indices,
                                                      clean_latents=clean_latents,
+                                                     clean_cam_emb=clean_cam_emb,
                                                      clean_latents_indices=clean_latent_indices,
                                                      clean_latents_2x=clean_latents_2x,
                                                      clean_latents_2x_indices=clean_latent_2x_indices,
@@ -337,6 +350,7 @@ class WanVideoReCamMasterPipelinePacked(BasePipeline):
                                                          cam_emb=current_cam_emb, 
                                                          latent_indices=latent_indices, 
                                                          clean_latents=clean_latents,
+                                                         clean_cam_emb=clean_cam_emb,
                                                          clean_latents_indices=clean_latent_indices,
                                                          clean_latents_2x=clean_latents_2x,
                                                          clean_latents_2x_indices=clean_latent_2x_indices,
@@ -352,12 +366,12 @@ class WanVideoReCamMasterPipelinePacked(BasePipeline):
 
                 # Scheduler
                 assert noise_pred.shape == latents_input.shape
-                latents = self.scheduler.step(noise_pred[:,:,:tgt_latent_length,...], self.scheduler.timesteps[progress_id], latents_input[:,:,:tgt_latent_length,...])
+                latents = self.scheduler.step(noise_pred[:,:,:tgt_latent_len,...], self.scheduler.timesteps[progress_id], latents_input[:,:,:tgt_latent_len,...])
                 # latents = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents_input)
 
-            # if is_last_section:
-            #     # add the first frame
-            #     latents = torch.cat([start_latents, latents], dim=2)
+            if is_last_section:
+                # add the first frame
+                latents = torch.cat([start_latents, latents], dim=2)
             
             total_generated_latent_frames += latents.shape[2]
             history_latents = torch.cat([latents.to(history_latents), history_latents], dim=2)
@@ -454,6 +468,7 @@ def model_fn_wan_video(
     tea_cache: TeaCache = None,
     latent_indices: Optional[torch.Tensor] = None,
     clean_latents: Optional[torch.Tensor] = None,
+    clean_cam_emb: Optional[torch.Tensor] = None,
     clean_latents_indices: Optional[torch.Tensor] = None,
     clean_latents_2x: Optional[torch.Tensor] = None,
     clean_latents_2x_indices: Optional[torch.Tensor] = None,
@@ -478,7 +493,7 @@ def model_fn_wan_video(
     x, freqs, (f, h, w) = frame_pack(dit, x, latent_indices, clean_latents, clean_latents_indices, clean_latents_2x, clean_latents_2x_indices, clean_latents_4x, clean_latents_4x_indices)
     
     for block in dit.blocks:
-        x = block(x, context, cam_emb, t_mod, freqs)
+        x = block(x, context, cam_emb, t_mod, freqs, clean_cam_emb)
 
     x = dit.head(x, t)
     original_context_lenght = f * h * w

@@ -229,7 +229,7 @@ class DiTBlock(nn.Module):
             approximate='tanh'), nn.Linear(ffn_dim, dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def forward(self, x, context, cam_emb, t_mod, freqs):
+    def forward(self, x, context, cam_emb, t_mod, freqs, clean_cam_emb):
         # msa: multi-head self-attention  mlp: multi-layer perceptron
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
@@ -237,7 +237,9 @@ class DiTBlock(nn.Module):
 
         # encode camera
         cam_emb = self.cam_encoder(cam_emb)
+        clean_cam_emb = self.cam_encoder(clean_cam_emb)
         cam_emb = cam_emb.repeat(1, 2, 1)
+        cam_emb = torch.cat([clean_cam_emb, cam_emb], dim = 1)
         cam_emb = cam_emb.unsqueeze(2).unsqueeze(3).repeat(1, 1, 30, 52, 1) # [1, 42, 30, 52, 1536]
         cam_emb = rearrange(cam_emb, 'b f h w d -> b (f h w) d')
         cam_emb = torch.cat([torch.zeros((1, input_x.shape[1] - cam_emb.shape[1], cam_emb.shape[-1])).to(dtype=cam_emb.dtype, device=cam_emb.device), cam_emb], dim=1)
@@ -412,6 +414,7 @@ class WanModel(torch.nn.Module):
                 use_gradient_checkpointing_offload: bool = False,
                 latent_indices: Optional[torch.Tensor] = None,
                 clean_latents: Optional[torch.Tensor] = None,
+                clean_cam_emb: Optional[torch.Tensor] = None,          # add clean_cam_emb as condition
                 clean_latents_indices: Optional[torch.Tensor] = None,
                 clean_latents_2x: Optional[torch.Tensor] = None,
                 clean_latents_2x_indices: Optional[torch.Tensor] = None,
@@ -441,16 +444,18 @@ class WanModel(torch.nn.Module):
                         x = torch.utils.checkpoint.checkpoint(
                             create_custom_forward(block),
                             x, context, cam_emb, t_mod, freqs,
+                            clean_cam_emb, 
                             use_reentrant=False,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
                         x, context, cam_emb, t_mod, freqs,
+                        clean_cam_emb, 
                         use_reentrant=False,
                     )
             else:
-                x = block(x, context, cam_emb, t_mod, freqs)
+                x = block(x, context, cam_emb, t_mod, freqs, clean_cam_emb)
 
         x = self.head(x, t)
         original_context_lenght = f * h * w

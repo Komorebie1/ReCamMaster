@@ -1,5 +1,4 @@
-# CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7" \
-python train_recammaster_packed.py  \
+CUDA_VISIBLE_DEVICES="0,1" python train_recammaster_packed.py  \
     --task train  \
     --dataset_path ./trainset  \
     --output_path ./models  \
@@ -8,6 +7,10 @@ python train_recammaster_packed.py  \
     --dit_path "models/Wan-AI/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors"  \
     --tiled  \
     --num_frames 81  \
-    --height 480  \
-    --width 832 \
-    --dataloader_num_workers 2
+    --height 640  \
+    --width 640 \
+    --dataloader_num_workers 2 \
+    --max_epochs 5 \
+    --use_gradient_checkpointing_offload \
+    --use_gradient_checkpointing \
+    --resume_ckpt_path ./models/ReCamMaster/checkpoints/step20000.ckpt \
